@@ -24,10 +24,19 @@ const char* WIFI_SSID     = "TU_WIFI";
 const char* WIFI_PASSWORD = "TU_PASSWORD";
 
 // IP y puerto donde corre server.py (tu PC en la misma red WiFi)
-const char* SERVER_URL = "http://192.168.1.100:5000/upload";
+const char* SERVER_URL     = "http://192.168.1.100:5000/upload";
+const char* NEXT_TURN_URL  = "http://192.168.1.100:5000/next_turn";
 
 // Cada cuánto se envía una foto (ms). 3000 = cada 3 segundos.
 const unsigned long CAPTURE_INTERVAL_MS = 3000;
+
+// ---------- BOTÓN FÍSICO DE CAMBIO DE TURNO ----------
+// Conectar un pulsador entre GPIO13 y GND (usa la resistencia pull-up
+// interna, así que no hace falta resistencia externa).
+// GPIO13 no se usa para la cámara ni es pin de arranque, por eso es seguro.
+#define BUTTON_PIN 13
+const unsigned long DEBOUNCE_MS = 250;
+unsigned long lastButtonPress = 0;
 
 // ---------- PINES CÁMARA AI-THINKER ----------
 #define PWDN_GPIO_NUM     32
@@ -126,9 +135,27 @@ void sendFrame() {
   esp_camera_fb_return(fb);
 }
 
+void notifyNextTurn() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Sin WiFi: no se pudo avisar del cambio de turno.");
+    return;
+  }
+  HTTPClient http;
+  http.begin(NEXT_TURN_URL);
+  int httpCode = http.POST("");
+  if (httpCode > 0) {
+    Serial.printf("Cambio de turno notificado. Respuesta: %d\n", httpCode);
+  } else {
+    Serial.printf("Error notificando cambio de turno: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(false);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   if (!initCamera()) {
     Serial.println("No se pudo iniciar la cámara. Reiniciando...");
@@ -145,6 +172,14 @@ void loop() {
   }
 
   unsigned long now = millis();
+
+  // Botón pulsado = nivel LOW (pull-up interno), con anti-rebote simple.
+  if (digitalRead(BUTTON_PIN) == LOW && (now - lastButtonPress) > DEBOUNCE_MS) {
+    lastButtonPress = now;
+    Serial.println("Botón de cambio de turno pulsado");
+    notifyNextTurn();
+  }
+
   if (now - lastCapture >= CAPTURE_INTERVAL_MS) {
     lastCapture = now;
     sendFrame();

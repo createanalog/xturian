@@ -147,6 +147,33 @@ def upload():
     }), 200
 
 
+@app.route("/next_turn", methods=["POST", "GET"])
+def next_turn():
+    """
+    Cambio de turno manual (botón físico en la ESP32-CAM, o llamado a mano).
+    Útil cuando un jugador pasa turno, cambia fichas, o hay que corregir
+    la rotación automática por algún motivo.
+    """
+    jugador_anterior = game.current_player
+    game.current_player = (game.current_player % game.num_players) + 1
+    game.history.append({
+        "jugador": jugador_anterior,
+        "casillas": [],
+        "palabras": [],
+        "puntos": 0,
+        "acumulado": game.scores[jugador_anterior],
+        "manual": True,
+        "nota": "Cambio de turno manual (botón)",
+        "timestamp": time.time(),
+    })
+    game.save()
+    return jsonify({
+        "status": "turno_cambiado",
+        "jugador_anterior": jugador_anterior,
+        "turno_actual": game.current_player,
+    }), 200
+
+
 @app.route("/score", methods=["GET"])
 def score():
     return jsonify(game.to_dict())
@@ -183,7 +210,7 @@ PANEL_HTML = """
   <tr>
     <td>{{ loop.revindex }}</td>
     <td>{{ jugada.jugador }}</td>
-    <td>{{ jugada.palabras|map(attribute=0)|join(', ') }}</td>
+    <td>{% if jugada.manual %}(cambio de turno manual){% else %}{{ jugada.palabras|map(attribute=0)|join(', ') }}{% endif %}</td>
     <td>{{ jugada.puntos }}</td>
     <td>{{ jugada.acumulado }}</td>
   </tr>
