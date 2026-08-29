@@ -17,6 +17,14 @@
       point currently flagged as an obstacle; this color image (not a
       black/white mask) is what gets streamed.
 
+  v5 ADDITIONS:
+    - H_TOLERANCE and S_TOLERANCE are now runtime-adjustable via plain URLs
+      (no web UI) — see handleSetHTolerance/handleSetSTolerance below.
+    - Symmetric hysteresis per point: a point needs MIN_CONSECUTIVE_DETECTIONS
+      (5) consecutive raw-positive frames to become a confirmed obstacle, AND
+      needs 5 consecutive raw-negative frames to become un-confirmed again.
+      A single stray frame in either direction doesn't flip the state.
+
   REUSED FROM THE PREVIOUS VERSION:
     - WiFi setup, JPEG capture (fast hardware-compressed sensor readout),
       fmt2rgb888 decode, fmt2jpg re-encode, and the MJPEG streaming loop.
@@ -26,6 +34,15 @@
     - The full-frame color mask and the 5x5 box blur — no longer needed,
       since each point already gets its own local averaging (the 9x9 box
       IS the smoothing for that point).
+
+  v6 FIX: the control endpoints (/setHTolerance, /setSTolerance) didn't
+  respond while a stream was active, because the Arduino WebServer library is
+  single-threaded/blocking — handleStream()'s while(client.connected()) loop
+  never returned control to loop(), so it never got to check for other
+  incoming requests. Fixed by splitting into two independent WebServer
+  instances (stream on port 80, control on port 81), each running in its own
+  FreeRTOS task pinned to a separate core — so the blocking stream loop on
+  one core can't starve the control endpoints on the other.
 
   Requires: "esp32" board package (Espressif) in Arduino IDE.
   Board: AI Thinker ESP32-CAM (or similar).
@@ -59,7 +76,8 @@ const char* password = "bubududu";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-WebServer server(80);
+WebServer streamServer(80);    // serves only the MJPEG stream ("/")
+WebServer controlServer(81);   // serves only the tolerance-setting endpoints
 
 const int FRAME_W = 160;
 const int FRAME_H = 120;
@@ -71,8 +89,25 @@ const int CIRCLE_RADIUS = 4;  // marker circle radius drawn on obstacles
 
 // H is stored as 0-255 representing 0-360 degrees (circular).
 // S and V are stored as 0-255 (standard 8-bit scale).
-const uint8_t H_TOLERANCE = 30;   // tune: max circular hue difference still considered "floor"
-const uint8_t S_TOLERANCE = 30;   // tune: max saturation difference still considered "floor"
+// Not const anymore — these can be changed at runtime via /setHTolerance and
+// /setSTolerance (see handleSetHTolerance/handleSetSTolerance below).
+// volatile: written by controlTask (core 0) and read by streamTask (core 1) —
+// this ensures each core actually re-reads the current value instead of
+// potentially using a stale cached copy.
+volatile uint8_t H_TOLERANCE = 12;   // tune: max circular hue difference still considered "floor"
+volatile uint8_t S_TOLERANCE = 30;   // tune: max saturation difference still considered "floor"
+
+// A point must register a positive (raw) detection for
+// MIN_CONSECUTIVE_DETECTIONS consecutive frames to become a CONFIRMED
+// obstacle, and must register a negative (raw) detection for the same
+// number of consecutive frames to become un-confirmed again. This is
+// symmetric hysteresis: a single stray frame in either direction doesn't
+// flip the state — only a sustained run does. obstacleConfirmed[i] holds
+// the current confirmed state per point; transitionCount[i] tracks how many
+// consecutive frames have disagreed with that state so far.
+const int MIN_CONSECUTIVE_DETECTIONS = 5;
+bool obstacleConfirmed[N_POINTS] = {false};
+int transitionCount[N_POINTS] = {0};
 
 struct Point { int x, y; };
 Point detectPoints[N_POINTS];
@@ -199,20 +234,65 @@ void detectAndMark(uint8_t *rgb, int w, int h) {
     uint8_t dh = hueDiff(pointHsv.h, refHsv.h);
     uint8_t ds = (uint8_t)abs((int)pointHsv.s - (int)refHsv.s);
 
-    bool isObstacle = (dh > H_TOLERANCE) || (ds > S_TOLERANCE);
-    if (isObstacle) {
+    bool rawDetection = (dh > H_TOLERANCE) || (ds > S_TOLERANCE);
+
+    // Symmetric hysteresis: if this frame agrees with the current confirmed
+    // state, reset the transition counter (no progress toward a flip). If it
+    // disagrees, count toward a flip — and only actually flip once
+    // MIN_CONSECUTIVE_DETECTIONS consecutive disagreeing frames have
+    // occurred. This applies equally whether we're about to turn ON or OFF.
+    if (rawDetection == obstacleConfirmed[i]) {
+      transitionCount[i] = 0;
+    } else {
+      transitionCount[i]++;
+      if (transitionCount[i] >= MIN_CONSECUTIVE_DETECTIONS) {
+        obstacleConfirmed[i] = rawDetection;
+        transitionCount[i] = 0;
+      }
+    }
+
+    if (obstacleConfirmed[i]) {
       drawCircle(rgb, w, h, detectPoints[i].x, detectPoints[i].y, CIRCLE_RADIUS,
                  255, 0, 0);  // red marker
     }
   }
 }
 
+// --- Runtime parameter endpoints ---
+// No web UI needed — just type the URL and hit enter, e.g.:
+//   http://<esp32-ip>/setHTolerance?value=20
+//   http://<esp32-ip>/setSTolerance?value=40
+// Both respond with plain text confirming the new value, and reject
+// missing/invalid values with a 400 instead of silently doing nothing.
+
+void handleSetHTolerance() {
+  if (!controlServer.hasArg("value")) {
+    controlServer.send(400, "text/plain", "Missing 'value' query param, e.g. ?value=20");
+    return;
+  }
+  int v = controlServer.arg("value").toInt();
+  v = clampCoord(v, 0, 255);
+  H_TOLERANCE = (uint8_t)v;
+  controlServer.send(200, "text/plain", "H_TOLERANCE set to " + String(H_TOLERANCE));
+}
+
+void handleSetSTolerance() {
+  if (!controlServer.hasArg("value")) {
+    controlServer.send(400, "text/plain", "Missing 'value' query param, e.g. ?value=40");
+    return;
+  }
+  int v = controlServer.arg("value").toInt();
+  v = clampCoord(v, 0, 255);
+  S_TOLERANCE = (uint8_t)v;
+  controlServer.send(200, "text/plain", "S_TOLERANCE set to " + String(S_TOLERANCE));
+}
+
 void handleStream() {
-  WiFiClient client = server.client();
+  WiFiClient client = streamServer.client();
   String boundary = "frame";
   String response = "HTTP/1.1 200 OK\r\n";
   response += "Content-Type: multipart/x-mixed-replace; boundary=" + boundary + "\r\n\r\n";
-  server.sendContent(response);
+  streamServer.sendContent(response);
 
   static uint8_t *rgbBuf = (uint8_t *)malloc(FRAME_W * FRAME_H * 3);
   if (!rgbBuf) {
@@ -311,6 +391,25 @@ void setupCamera() {
   }
 }
 
+void streamTask(void *param) {
+  streamServer.on("/", HTTP_GET, handleStream);
+  streamServer.begin();
+  while (true) {
+    streamServer.handleClient();
+    vTaskDelay(1);   // yield so this task doesn't starve the scheduler
+  }
+}
+
+void controlTask(void *param) {
+  controlServer.on("/setHTolerance", HTTP_GET, handleSetHTolerance);
+  controlServer.on("/setSTolerance", HTTP_GET, handleSetSTolerance);
+  controlServer.begin();
+  while (true) {
+    controlServer.handleClient();
+    vTaskDelay(10);   // control requests are infrequent, no need to poll tightly
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   setupCamera();
@@ -323,15 +422,26 @@ void setup() {
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("Camera stream ready at: http://");
-  Serial.println(WiFi.localIP());
+  Serial.print("Stream:  http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/");
+  Serial.print("Control: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println(":81/setHTolerance?value=20  (and /setSTolerance)");
 
-  server.on("/", HTTP_GET, handleStream);
-  server.begin();
+  // Two separate tasks on two separate cores: streamTask's handleStream()
+  // blocks for as long as a client is watching the video, so it must not
+  // share a core/loop with the control endpoints, or /setHTolerance and
+  // /setSTolerance would sit unanswered until the stream disconnects — the
+  // exact problem you ran into with a single shared WebServer/loop().
+  xTaskCreatePinnedToCore(streamTask,  "streamTask",  8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(controlTask, "controlTask", 4096, NULL, 1, NULL, 0);
 }
 
 void loop() {
-  server.handleClient();
+  // Intentionally empty — both servers now run in their own dedicated tasks
+  // (see setup()). The default Arduino loop task just idles.
+  vTaskDelay(1000);
 }
 
 /*
