@@ -1,36 +1,31 @@
 /*
-  ESP32-CAM Obstacle Detector — floor-color-difference approach
-  Equivalent to the Python/OpenCV/Flask script, adapted for ESP32 constraints.
+  ESP32-CAM Obstacle Detector — point-sampling + HSV comparison approach
 
-  v2 CHANGE: capture is now done in JPEG (hardware-compressed) instead of
-  RGB565. The OV2640's raw/uncompressed capture path is known to be limited
-  to roughly ~7 FPS at QQVGA regardless of lighting or code — that's a sensor
-  pipeline limitation, not something fixable in software. JPEG capture uses
-  the sensor's onboard hardware encoder and is typically 3-5x faster to read
-  out, at the cost of needing to decode it back to raw pixels in software
-  before running the color-distance mask (fmt2rgb888) and re-encode the
-  result to JPEG for streaming (fmt2jpg). Both conversions use the esp32
-  library's own lightweight (de)coders — no OpenCV needed.
+  v4 REWRITE: replaced the full-frame color-mask approach with point
+  sampling, per your spec:
+    - N detection points, evenly spaced in a row in the image's upper region.
+    - 3 reference ("floor") points, evenly spaced in a row in the lower region.
+    - Each point is sampled as the average RGB of a 9x9 box around it.
+    - Each of the N detection points' box-average is individually converted
+      to HSV -> an array of N HSV values.
+    - The 3 reference points' box-averages are averaged together *first* (in
+      RGB), then that single combined value is converted to HSV -> one
+      reference HSV.
+    - Comparison uses H and S only (V/brightness ignored), with H treated as
+      circular (hue wraps at 360 degrees).
+    - A filled circle is drawn on the color output image at every detection
+      point currently flagged as an obstacle; this color image (not a
+      black/white mask) is what gets streamed.
 
-  v3 CHANGE: added a separable 5x5 box-blur smoothing pass right after
-  decode, before floor sampling and mask computation. Smooths out sensor
-  noise/small speckling so the per-channel floor bounds test (see below)
-  isn't thrown off by isolated noisy pixels.
+  REUSED FROM THE PREVIOUS VERSION:
+    - WiFi setup, JPEG capture (fast hardware-compressed sensor readout),
+      fmt2rgb888 decode, fmt2jpg re-encode, and the MJPEG streaming loop.
+    - The DRAM frame-buffer / pin config / camera setup are unchanged.
 
-  v3 CHANGE (also): switched from a single combined Euclidean color-distance
-  threshold to independent per-channel [min,max] bounds (matching the
-  original cv2.inRange per-channel behavior), since a floor can vary a lot
-  in one channel while staying tight in others — a single combined tolerance
-  forces a bad tradeoff between missing real obstacles and flagging natural
-  floor texture as obstacles.
-
-  KEY DIFFERENCES FROM THE ORIGINAL PYTHON VERSION:
-  - No OpenCV. Direct pixel math on a decoded RGB888 buffer.
-  - No full HSV conversion — uses Euclidean color-distance from a sampled
-    floor color instead of HSV min/max percentile thresholds.
-  - No percentile calc — uses an averaged sample of a floor patch instead.
-  - Capture format is JPEG (fast sensor readout), decoded to RGB888 in
-    software for processing, then re-encoded to JPEG for the MJPEG stream.
+  DROPPED FROM THE PREVIOUS VERSION:
+    - The full-frame color mask and the 5x5 box blur — no longer needed,
+      since each point already gets its own local averaging (the 9x9 box
+      IS the smoothing for that point).
 
   Requires: "esp32" board package (Espressif) in Arduino IDE.
   Board: AI Thinker ESP32-CAM (or similar).
@@ -40,6 +35,7 @@
 #include "img_converters.h"   // fmt2rgb888, fmt2jpg
 #include <WiFi.h>
 #include <WebServer.h>
+#include <math.h>
 
 // ---------- WiFi credentials ----------
 const char* ssid     = "Sarita";
@@ -68,121 +64,145 @@ WebServer server(80);
 const int FRAME_W = 160;
 const int FRAME_H = 120;
 
-// Per-channel bounds instead of a single combined distance — this matches
-// the original cv2.inRange() behavior (an axis-aligned box in color space)
-// rather than a sphere around one average color. Important because a floor
-// can vary a lot in one channel (e.g. red, from wood grain/lighting) while
-// staying tight in others — a single combined tolerance forces a bad
-// tradeoff between missing real obstacles and flagging natural texture as
-// obstacles. Independent per-channel bounds avoid that tradeoff.
-uint8_t floorRmin = 100, floorRmax = 156;
-uint8_t floorGmin = 100, floorGmax = 156;
-uint8_t floorBmin = 100, floorBmax = 156;
-const int CHANNEL_MARGIN = 10;   // padding added beyond observed min/max, tune this
-const int RESAMPLE_EVERY_N_FRAMES = 10;
-uint32_t frameCount = 0;
+// ---------- Point-sampling configuration ----------
+#define N_POINTS 8            // number of detection points across the top row
+const int BOX_RADIUS = 4;     // 9x9 box -> +/-4 pixels around the point
+const int CIRCLE_RADIUS = 4;  // marker circle radius drawn on obstacles
 
-void resampleFloorColor(uint8_t *rgb, int w, int h) {
-  // Sample a patch in the bottom-center of the frame (like the Python
-  // version's hsv[0.8h:h, 0.3w:0.7w] region), track per-channel min/max.
-  int y0 = (int)(h * 0.8f), y1 = h;
-  int x0 = (int)(w * 0.3f), x1 = (int)(w * 0.7f);
+// H is stored as 0-255 representing 0-360 degrees (circular).
+// S and V are stored as 0-255 (standard 8-bit scale).
+const uint8_t H_TOLERANCE = 30;   // tune: max circular hue difference still considered "floor"
+const uint8_t S_TOLERANCE = 30;   // tune: max saturation difference still considered "floor"
 
-  uint8_t rMin = 255, rMax = 0, gMin = 255, gMax = 0, bMin = 255, bMax = 0;
-  bool any = false;
-  for (int y = y0; y < y1; y += 2) {
-    for (int x = x0; x < x1; x += 2) {
-      int idx = (y * w + x) * 3;
-      uint8_t r = rgb[idx + 0], g = rgb[idx + 1], b = rgb[idx + 2];
-      if (r < rMin) rMin = r;  if (r > rMax) rMax = r;
-      if (g < gMin) gMin = g;  if (g > gMax) gMax = g;
-      if (b < bMin) bMin = b;  if (b > bMax) bMax = b;
-      any = true;
-    }
+struct Point { int x, y; };
+Point detectPoints[N_POINTS];
+Point refPoints[3];
+
+struct HSV { uint8_t h, s, v; };
+
+void initPoints() {
+  // Detection points: evenly spaced row in the upper region of the frame.
+  int marginX = FRAME_W / (N_POINTS + 1);
+  int detectY = (int)(FRAME_H * 0.25f);
+  for (int i = 0; i < N_POINTS; i++) {
+    detectPoints[i].x = marginX * (i + 1);
+    detectPoints[i].y = detectY;
   }
-  if (any) {
-    // NOTE: this uses true min/max (not the 5th/95th percentile your Python
-    // version used), so a few noisy/outlier pixels can widen the band more
-    // than percentiles would. If you see the mask getting too permissive,
-    // that's why — consider averaging min/max across a couple of resamples,
-    // or shrinking CHANNEL_MARGIN to compensate.
-    floorRmin = (rMin > CHANNEL_MARGIN) ? rMin - CHANNEL_MARGIN : 0;
-    floorRmax = (rMax + CHANNEL_MARGIN < 255) ? rMax + CHANNEL_MARGIN : 255;
-    floorGmin = (gMin > CHANNEL_MARGIN) ? gMin - CHANNEL_MARGIN : 0;
-    floorGmax = (gMax + CHANNEL_MARGIN < 255) ? gMax + CHANNEL_MARGIN : 255;
-    floorBmin = (bMin > CHANNEL_MARGIN) ? bMin - CHANNEL_MARGIN : 0;
-    floorBmax = (bMax + CHANNEL_MARGIN < 255) ? bMax + CHANNEL_MARGIN : 255;
-  }
+
+  // Reference (floor) points: 3 points evenly spaced in the lower region.
+  int refY = (int)(FRAME_H * 0.85f);
+  refPoints[0] = { (int)(FRAME_W * 0.25f), refY };
+  refPoints[1] = { (int)(FRAME_W * 0.50f), refY };
+  refPoints[2] = { (int)(FRAME_W * 0.75f), refY };
 }
 
-// Builds the obstacle mask in-place: a pixel counts as "floor" only if ALL
-// THREE channels fall within their own independent bounds (matching
-// cv2.inRange's per-channel AND behavior) — otherwise it's "obstacle".
-void computeObstacleMaskInPlace(uint8_t *rgb, int w, int h) {
-  int total = w * h;
-
-  for (int i = 0; i < total; i++) {
-    int idx = i * 3;
-    uint8_t r = rgb[idx + 0], g = rgb[idx + 1], b = rgb[idx + 2];
-
-    bool isFloor = (r >= floorRmin && r <= floorRmax) &&
-                   (g >= floorGmin && g <= floorGmax) &&
-                   (b >= floorBmin && b <= floorBmax);
-
-    uint8_t v = isFloor ? 0 : 255;
-    rgb[idx + 0] = v;
-    rgb[idx + 1] = v;
-    rgb[idx + 2] = v;
-  }
-}
-
-// Separable 5x5 box blur (horizontal pass then vertical pass) — same result
-// as a naive 5x5 blur but ~2.5x cheaper (2x5 samples/pixel/channel instead
-// of 25), which matters on ESP32's limited CPU. Edge pixels clamp to the
-// nearest valid coordinate (edge replication) rather than reading out of
-// bounds. `tmp` and `dst` must both be w*h*3 buffers distinct from `src`
-// (the vertical pass reads tmp and writes dst, so dst can safely be the
-// same buffer as src — it's only read via tmp by that point).
 inline int clampCoord(int v, int lo, int hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
 }
 
-void boxBlur5x5(uint8_t *src, uint8_t *tmp, uint8_t *dst, int w, int h) {
-  // Horizontal pass: src -> tmp
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      int sumR = 0, sumG = 0, sumB = 0;
-      for (int k = -2; k <= 2; k++) {
-        int xx = clampCoord(x + k, 0, w - 1);
-        int idx = (y * w + xx) * 3;
-        sumR += src[idx + 0];
-        sumG += src[idx + 1];
-        sumB += src[idx + 2];
-      }
-      int outIdx = (y * w + x) * 3;
-      tmp[outIdx + 0] = sumR / 5;
-      tmp[outIdx + 1] = sumG / 5;
-      tmp[outIdx + 2] = sumB / 5;
+// Average the RGB pixels in a 9x9 box (BOX_RADIUS=4 -> 9 wide) around (px,py).
+void sampleBox9x9(uint8_t *rgb, int w, int h, int px, int py,
+                   uint8_t &outR, uint8_t &outG, uint8_t &outB) {
+  int sumR = 0, sumG = 0, sumB = 0, count = 0;
+  for (int dy = -BOX_RADIUS; dy <= BOX_RADIUS; dy++) {
+    int yy = clampCoord(py + dy, 0, h - 1);
+    for (int dx = -BOX_RADIUS; dx <= BOX_RADIUS; dx++) {
+      int xx = clampCoord(px + dx, 0, w - 1);
+      int idx = (yy * w + xx) * 3;
+      sumR += rgb[idx + 0];
+      sumG += rgb[idx + 1];
+      sumB += rgb[idx + 2];
+      count++;
     }
   }
+  outR = sumR / count;
+  outG = sumG / count;
+  outB = sumB / count;
+}
 
-  // Vertical pass: tmp -> dst
-  for (int x = 0; x < w; x++) {
-    for (int y = 0; y < h; y++) {
-      int sumR = 0, sumG = 0, sumB = 0;
-      for (int k = -2; k <= 2; k++) {
-        int yy = clampCoord(y + k, 0, h - 1);
-        int idx = (yy * w + x) * 3;
-        sumR += tmp[idx + 0];
-        sumG += tmp[idx + 1];
-        sumB += tmp[idx + 2];
+// Standard RGB->HSV conversion. H,S,V all output as 0-255 (H represents
+// 0-360 degrees mapped onto that range). Only called a handful of times per
+// frame (N + 1), so float math here is cheap — no need to optimize this part.
+HSV rgbToHsv(uint8_t r, uint8_t g, uint8_t b) {
+  HSV out;
+  uint8_t maxc = max(r, max(g, b));
+  uint8_t minc = min(r, min(g, b));
+  out.v = maxc;
+
+  int delta = maxc - minc;
+  if (maxc == 0 || delta == 0) {
+    out.s = 0;
+    out.h = 0;
+    return out;
+  }
+  out.s = (uint8_t)((delta * 255) / maxc);
+
+  float hf;
+  if (maxc == r)      hf = 60.0f * fmodf(((float)(g - b) / delta), 6.0f);
+  else if (maxc == g) hf = 60.0f * (((float)(b - r) / delta) + 2.0f);
+  else                hf = 60.0f * (((float)(r - g) / delta) + 4.0f);
+  if (hf < 0) hf += 360.0f;
+
+  out.h = (uint8_t)(hf * 255.0f / 360.0f);
+  return out;
+}
+
+// Circular hue difference: since H wraps at 256 (representing 360 degrees),
+// a direct subtraction would be wrong near the wraparound point.
+inline uint8_t hueDiff(uint8_t h1, uint8_t h2) {
+  int d = abs((int)h1 - (int)h2);
+  return (uint8_t)(d > 128 ? 256 - d : d);
+}
+
+void drawCircle(uint8_t *rgb, int w, int h, int cx, int cy, int radius,
+                 uint8_t r, uint8_t g, uint8_t b) {
+  for (int dy = -radius; dy <= radius; dy++) {
+    int yy = cy + dy;
+    if (yy < 0 || yy >= h) continue;
+    for (int dx = -radius; dx <= radius; dx++) {
+      int xx = cx + dx;
+      if (xx < 0 || xx >= w) continue;
+      if (dx * dx + dy * dy <= radius * radius) {
+        int idx = (yy * w + xx) * 3;
+        rgb[idx + 0] = r;
+        rgb[idx + 1] = g;
+        rgb[idx + 2] = b;
       }
-      int outIdx = (y * w + x) * 3;
-      dst[outIdx + 0] = sumR / 5;
-      dst[outIdx + 1] = sumG / 5;
-      dst[outIdx + 2] = sumB / 5;
+    }
+  }
+}
+
+// Samples all points, builds the reference HSV, compares each detection
+// point against it (H and S only), and draws a circle on obstacle points
+// directly onto the color image passed in.
+void detectAndMark(uint8_t *rgb, int w, int h) {
+  // --- Reference: sample 3 points, average their RGB together FIRST,
+  // then convert that single combined average to HSV. ---
+  uint8_t r0, g0, b0, r1, g1, b1, r2, g2, b2;
+  sampleBox9x9(rgb, w, h, refPoints[0].x, refPoints[0].y, r0, g0, b0);
+  sampleBox9x9(rgb, w, h, refPoints[1].x, refPoints[1].y, r1, g1, b1);
+  sampleBox9x9(rgb, w, h, refPoints[2].x, refPoints[2].y, r2, g2, b2);
+
+  uint8_t refR = (uint8_t)(((int)r0 + r1 + r2) / 3);
+  uint8_t refG = (uint8_t)(((int)g0 + g1 + g2) / 3);
+  uint8_t refB = (uint8_t)(((int)b0 + b1 + b2) / 3);
+  HSV refHsv = rgbToHsv(refR, refG, refB);
+
+  // --- Detection points: each sampled and converted to HSV independently. ---
+  for (int i = 0; i < N_POINTS; i++) {
+    uint8_t pr, pg, pb;
+    sampleBox9x9(rgb, w, h, detectPoints[i].x, detectPoints[i].y, pr, pg, pb);
+    HSV pointHsv = rgbToHsv(pr, pg, pb);
+
+    uint8_t dh = hueDiff(pointHsv.h, refHsv.h);
+    uint8_t ds = (uint8_t)abs((int)pointHsv.s - (int)refHsv.s);
+
+    bool isObstacle = (dh > H_TOLERANCE) || (ds > S_TOLERANCE);
+    if (isObstacle) {
+      drawCircle(rgb, w, h, detectPoints[i].x, detectPoints[i].y, CIRCLE_RADIUS,
+                 255, 0, 0);  // red marker
     }
   }
 }
@@ -194,11 +214,9 @@ void handleStream() {
   response += "Content-Type: multipart/x-mixed-replace; boundary=" + boundary + "\r\n\r\n";
   server.sendContent(response);
 
-  // Reusable RGB888 working buffer (allocated once, not per-frame)
   static uint8_t *rgbBuf = (uint8_t *)malloc(FRAME_W * FRAME_H * 3);
-  static uint8_t *blurTmp = (uint8_t *)malloc(FRAME_W * FRAME_H * 3);
-  if (!rgbBuf || !blurTmp) {
-    Serial.println("Failed to allocate rgbBuf/blurTmp");
+  if (!rgbBuf) {
+    Serial.println("Failed to allocate rgbBuf");
     return;
   }
 
@@ -211,21 +229,12 @@ void handleStream() {
     bool decoded = fmt2rgb888(fb->buf, fb->len, fb->format, rgbBuf);
     uint32_t t2 = micros();
 
-    if (decoded) {
-      boxBlur5x5(rgbBuf, blurTmp, rgbBuf, FRAME_W, FRAME_H);
-    }
-    uint32_t t2b = micros();
-
-    if (decoded) {
-      if (frameCount % RESAMPLE_EVERY_N_FRAMES == 0) {
-        resampleFloorColor(rgbBuf, FRAME_W, FRAME_H);
-      }
-      computeObstacleMaskInPlace(rgbBuf, FRAME_W, FRAME_H);
-    }
-    frameCount++;
-    uint32_t t3 = micros();
-
     esp_camera_fb_return(fb);   // done with the JPEG source buffer
+
+    if (decoded) {
+      detectAndMark(rgbBuf, FRAME_W, FRAME_H);
+    }
+    uint32_t t3 = micros();
 
     uint8_t *jpg_buf = NULL;
     size_t jpg_len = 0;
@@ -249,24 +258,22 @@ void handleStream() {
 
     // --- Timing report: prints once a second. Remove once tuned. ---
     static uint32_t lastReport = 0;
-    static uint32_t capUs = 0, decUs = 0, blurUs = 0, maskUs = 0, encUs = 0, sendUs = 0, frames = 0;
+    static uint32_t capUs = 0, decUs = 0, detUs = 0, encUs = 0, sendUs = 0, frames = 0;
     capUs  += (t1 - t0);
     decUs  += (t2 - t1);
-    blurUs += (t2b - t2);
-    maskUs += (t3 - t2b);
+    detUs  += (t3 - t2);
     encUs  += (t4 - t3);
     sendUs += (t5 - t4);
     frames++;
     if (millis() - lastReport > 1000) {
-      Serial.printf("FPS:%d  capture:%lums  decode:%lums  blur:%lums  mask:%lums  jpegEnc:%lums  send:%lums\n",
+      Serial.printf("FPS:%d  capture:%lums  decode:%lums  detect:%lums  jpegEnc:%lums  send:%lums\n",
         frames,
         (unsigned long)(capUs / frames / 1000),
         (unsigned long)(decUs / frames / 1000),
-        (unsigned long)(blurUs / frames / 1000),
-        (unsigned long)(maskUs / frames / 1000),
+        (unsigned long)(detUs / frames / 1000),
         (unsigned long)(encUs / frames / 1000),
         (unsigned long)(sendUs / frames / 1000));
-      capUs = decUs = blurUs = maskUs = encUs = sendUs = 0;
+      capUs = decUs = detUs = encUs = sendUs = 0;
       frames = 0;
       lastReport = millis();
     }
@@ -291,11 +298,9 @@ void setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
 
-  // JPEG capture: fast hardware-compressed sensor readout. We decode this
-  // back to RGB888 in software (see handleStream) before running the mask.
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_QQVGA;   // 160x120
-  config.jpeg_quality = 12;              // capture quality; lower number = higher quality/larger
+  config.jpeg_quality = 12;
   config.fb_count = 1;
   config.fb_location = CAMERA_FB_IN_DRAM;
 
@@ -309,6 +314,7 @@ void setupCamera() {
 void setup() {
   Serial.begin(115200);
   setupCamera();
+  initPoints();
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
@@ -330,15 +336,18 @@ void loop() {
 
 /*
   TUNING NOTES:
-  - If capture (t1-t0) is still slow even in JPEG mode, try raising
-    config.jpeg_quality's number (e.g. 20-30) for a smaller/faster-to-produce
-    JPEG from the sensor, at the cost of more compression artifacts feeding
-    into fmt2rgb888.
-  - decode (fmt2rgb888) and re-encode (fmt2jpg) are now separate costs the
-    RGB565 version didn't have — watch these in the Serial output. If they
-    dominate, consider skipping the re-encode entirely: since the mask is
-    binary black/white, you could send a raw bitmap or a tiny "obstacle
-    direction" decision over a lightweight custom protocol instead of MJPEG,
-    which is likely the better design once you're past debugging anyway.
-  - COLOR_TOLERANCE and RESAMPLE_EVERY_N_FRAMES behave the same as before.
+  - N_POINTS, BOX_RADIUS, CIRCLE_RADIUS: adjust point count/coverage and
+    marker size to taste.
+  - H_TOLERANCE / S_TOLERANCE: tune independently, same philosophy as the
+    earlier per-channel discussion — if you're getting false positives on
+    normal floor texture, widen the relevant tolerance; if you're missing
+    real obstacles, narrow it.
+  - detectPoints/refPoints are currently a single row each. If your floor
+    has perspective (near vs far parts of the floor look different), you
+    may want the detection row higher/lower, or multiple rows — easy to
+    extend inside initPoints().
+  - This point-sampling approach is inherently much cheaper than the old
+    full-frame mask (only N+3 box samples and N+1 HSV conversions per frame,
+    versus touching every pixel), so "detect" time in the timing report
+    should be small — worth checking against the earlier full-frame numbers.
 */
