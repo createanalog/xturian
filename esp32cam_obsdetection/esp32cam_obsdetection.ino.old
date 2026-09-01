@@ -59,19 +59,6 @@
       (0..SCORE_MAX) that nudges up/down per frame instead of resetting —
       occasional flicker no longer erases a long run of consistent evidence.
 
-  v8 ADDITIONS:
-    - White balance locked (set_whitebal/set_awb_gain/set_wb_mode) instead of
-      left on auto — AWB re-adjusting color temperature per frame was a
-      likely contributor to the hue instability fixed in v7. Pick a
-      wb_mode preset (1-4) matching your actual lighting.
-    - Reference HSV is now smoothed across frames with a circular-aware
-      exponential moving average (smoothReferenceHsv/REF_SMOOTHING_ALPHA),
-      instead of being recomputed fresh from only 3 samples every frame.
-    - sampleBox9x9 now returns the MEDIAN of the 81 pixels per channel
-      instead of the mean — robust to a single outlier pixel (a highlight or
-      shadow inside the box) skewing the sample. Costs more CPU (a sort per
-      channel per point) — check the "detect:" timing column after this.
-
   Requires: "esp32" board package (Espressif) in Arduino IDE.
   Board: AI Thinker ESP32-CAM (or similar).
 */
@@ -81,7 +68,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <math.h>
-#include <stdlib.h>   // qsort, used for median box sampling
 
 // ---------- WiFi credentials ----------
 const char* ssid     = "Sarita";
@@ -181,43 +167,24 @@ inline int clampCoord(int v, int lo, int hi) {
   return v;
 }
 
-// Median RGB of a 9x9 box (BOX_RADIUS=4 -> 9 wide) around (px,py). Median
-// instead of mean: a single specular highlight or shadow pixel inside the
-// box can skew a mean noticeably, but has almost no effect on a median.
-// Costs more CPU than a running sum (a sort per channel per point instead
-// of an accumulator), but qsort on ~81 elements is cheap relative to the
-// rest of the frame budget — worth checking the "detect:" timing column
-// after this change to confirm.
-const int BOX_SIDE = (2 * BOX_RADIUS + 1);
-const int BOX_PIXELS = BOX_SIDE * BOX_SIDE;   // 81 for BOX_RADIUS=4
-
-int compareUint8(const void *a, const void *b) {
-  return (int)(*(const uint8_t *)a) - (int)(*(const uint8_t *)b);
-}
-
+// Average the RGB pixels in a 9x9 box (BOX_RADIUS=4 -> 9 wide) around (px,py).
 void sampleBox9x9(uint8_t *rgb, int w, int h, int px, int py,
                    uint8_t &outR, uint8_t &outG, uint8_t &outB) {
-  static uint8_t rVals[BOX_PIXELS], gVals[BOX_PIXELS], bVals[BOX_PIXELS];
-  int idx = 0;
+  int sumR = 0, sumG = 0, sumB = 0, count = 0;
   for (int dy = -BOX_RADIUS; dy <= BOX_RADIUS; dy++) {
     int yy = clampCoord(py + dy, 0, h - 1);
     for (int dx = -BOX_RADIUS; dx <= BOX_RADIUS; dx++) {
       int xx = clampCoord(px + dx, 0, w - 1);
-      int i = (yy * w + xx) * 3;
-      rVals[idx] = rgb[i + 0];
-      gVals[idx] = rgb[i + 1];
-      bVals[idx] = rgb[i + 2];
-      idx++;
+      int idx = (yy * w + xx) * 3;
+      sumR += rgb[idx + 0];
+      sumG += rgb[idx + 1];
+      sumB += rgb[idx + 2];
+      count++;
     }
   }
-  qsort(rVals, BOX_PIXELS, sizeof(uint8_t), compareUint8);
-  qsort(gVals, BOX_PIXELS, sizeof(uint8_t), compareUint8);
-  qsort(bVals, BOX_PIXELS, sizeof(uint8_t), compareUint8);
-
-  int medianIdx = BOX_PIXELS / 2;   // 40 for 81 elements — the true middle
-  outR = rVals[medianIdx];
-  outG = gVals[medianIdx];
-  outB = bVals[medianIdx];
+  outR = sumR / count;
+  outG = sumG / count;
+  outB = sumB / count;
 }
 
 // Standard RGB->HSV conversion. H,S,V all output as 0-255 (H represents
@@ -272,34 +239,6 @@ void drawCircle(uint8_t *rgb, int w, int h, int cx, int cy, int radius,
   }
 }
 
-// Reference HSV smoothing: without this, the reference is recomputed fresh
-// every single frame from just 3 samples, so any per-frame noise (sensor,
-// lighting flicker, JPEG artifacts) feeds directly into the comparison every
-// frame. An exponential moving average damps that. Hue needs circular-aware
-// smoothing (a naive average is wrong near the 0/360 wraparound point) — we
-// move the smoothed hue toward the new sample by the shortest angular path
-// instead. -1 is a sentinel meaning "not yet initialized" (first frame).
-const float REF_SMOOTHING_ALPHA = 0.2f;   // weight given to the new sample each frame; higher = less smoothing
-float refHSmoothed = -1.0f;
-float refSSmoothed = -1.0f;
-
-void smoothReferenceHsv(HSV newRef) {
-  if (refHSmoothed < 0) {
-    refHSmoothed = newRef.h;
-    refSSmoothed = newRef.s;
-    return;
-  }
-
-  float diff = (float)newRef.h - refHSmoothed;
-  if (diff > 128.0f)  diff -= 256.0f;   // take the shorter way around the circle
-  if (diff < -128.0f) diff += 256.0f;
-  refHSmoothed += REF_SMOOTHING_ALPHA * diff;
-  if (refHSmoothed < 0)     refHSmoothed += 256.0f;
-  if (refHSmoothed >= 256)  refHSmoothed -= 256.0f;
-
-  refSSmoothed += REF_SMOOTHING_ALPHA * ((float)newRef.s - refSSmoothed);
-}
-
 // Samples all points, builds the reference HSV, compares each detection
 // point against it (H and S only), and draws a circle on obstacle points
 // directly onto the color image passed in.
@@ -314,13 +253,7 @@ void detectAndMark(uint8_t *rgb, int w, int h) {
   uint8_t refR = (uint8_t)(((int)r0 + r1 + r2) / 3);
   uint8_t refG = (uint8_t)(((int)g0 + g1 + g2) / 3);
   uint8_t refB = (uint8_t)(((int)b0 + b1 + b2) / 3);
-  HSV rawRefHsv = rgbToHsv(refR, refG, refB);
-
-  smoothReferenceHsv(rawRefHsv);
-  HSV refHsv;
-  refHsv.h = (uint8_t)(refHSmoothed + 0.5f);
-  refHsv.s = (uint8_t)(refSSmoothed + 0.5f);
-  refHsv.v = rawRefHsv.v;   // V isn't used in comparisons, no need to smooth it
+  HSV refHsv = rgbToHsv(refR, refG, refB);
 
   // --- Detection points: each sampled and converted to HSV independently. ---
   for (int i = 0; i < N_POINTS; i++) {
@@ -496,20 +429,6 @@ void setupCamera() {
     Serial.printf("Camera init failed: 0x%x\n", err);
     while (true) delay(1000);
   }
-
-  // --- Lock white balance instead of letting AWB roam ---
-  // This ties directly into the hue-stability problems we've been fighting:
-  // if AWB keeps re-adjusting color temperature frame to frame, hue drifts
-  // even on a perfectly static floor, independent of exposure, smoothing, or
-  // anything else in the detection pipeline. Locking it removes that noise
-  // source at the root instead of compensating for it downstream.
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-   // s->set_whitebal(s, 1);     // 0 = disable auto white balance
-   // s->set_awb_gain(s, 0);     // 0 = disable automatic AWB gain adjustment
-   // s->set_wb_mode(s, 0);      // fixed white balance mode: 0=Auto(unused now)/1=Sunny/2=Cloudy/3=Office/4=Home
-                               // pick whichever preset (1-4) best matches your actual lighting; test and adjust
-  }
 }
 
 void streamTask(void *param) {
@@ -590,13 +509,4 @@ void loop() {
     ON and OFF thresholds is your hysteresis band. Widening the gap (e.g.
     SCORE_MAX=16, ON=10, OFF=6) makes state changes slower but more resistant
     to noise; narrowing it makes the detector snappier but more flicker-prone.
-  - REF_SMOOTHING_ALPHA: lower = smoother/slower-to-react reference, higher
-    = snappier but noisier. 0.2 is a starting point.
-  - wb_mode preset: try 1 (Sunny), 2 (Cloudy), 3 (Office), 4 (Home) and see
-    which keeps colors most stable/accurate under your actual lighting.
-  - If median sampling noticeably hurts your FPS budget, you can revert
-    sampleBox9x9 to the mean version — median mainly helps when your
-    floor/points have occasional bright specular spots or hard shadows
-    inside the 9x9 box; if that's not a problem for you, the mean was
-    cheaper and worked fine.
 */
