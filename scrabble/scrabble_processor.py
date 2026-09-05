@@ -7,33 +7,78 @@ Flujo general por cada foto recibida:
   2. Corregir la perspectiva y recortar la rejilla 15x15.
   3. Determinar qué casillas están ocupadas (comparando contra el tablero
      vacío de referencia).
-  4. Reconocer la letra de cada casilla ocupada por template matching contra
-     la biblioteca de plantillas generada en la calibración.
+  4. Reconocer la letra de cada casilla ocupada con EasyOCR (red neuronal,
+     tolerante a ruido/blur/iluminación variable).
   5. Comparar contra el estado anterior -> nuevas fichas colocadas.
   6. Si las nuevas fichas forman una jugada válida (alineadas en una fila o
      columna, contiguas), calcular su puntuación oficial.
 
 IMPORTANTE - calibración necesaria antes de jugar (ver README.md):
   - board_templates/empty_board.jpg   -> foto del tablero vacío
-  - board_templates/letters/<LETRA>.png -> una plantilla recortada por letra
+  (ya NO hace falta calibrar plantillas por letra: EasyOCR no las necesita)
 """
 
 import os
-import json
-import glob
+import importlib
 import cv2
 import numpy as np
 
 from board_config import BOARD_SIZE, BOARD_LAYOUT, LETTER_VALUES, BINGO_BONUS, BINGO_TILE_COUNT
 
+# ---------------------------------------------------------------------------
+# Selección del motor de OCR (easyocr / ocrad / tesseract)
+# ---------------------------------------------------------------------------
+# Cada motor vive en su propio módulo (lrecog_<nombre>.py) con la misma
+# interfaz: get_ocr_reader() y recognize_letter(cell_gray). Se importa de
+# forma PEREZOSA (recién cuando se selecciona o se usa por primera vez)
+# para no forzar tener instaladas las librerías/binarios de los 3 motores
+# si solo vas a usar uno.
+_OCR_ENGINE_MODULES = {
+    "easyocr": "lrecog_easyocr",
+    "ocrad": "lrecog_ocrad",
+    "tesseract": "lrecog_tesseract",
+}
+DEFAULT_OCR_ENGINE = "tesseract"
+
+_active_engine = None
+_active_engine_name = DEFAULT_OCR_ENGINE
+
+
+def set_ocr_engine(name):
+    """Selecciona qué motor de OCR usar: 'easyocr', 'ocrad' o 'tesseract'."""
+    global _active_engine, _active_engine_name
+    name = name.lower()
+    if name not in _OCR_ENGINE_MODULES:
+        raise ValueError(
+            f"Motor de OCR desconocido: {name!r}. Opciones válidas: "
+            f"{list(_OCR_ENGINE_MODULES)}"
+        )
+    _active_engine = importlib.import_module(_OCR_ENGINE_MODULES[name])
+    _active_engine_name = name
+
+
+def _engine():
+    global _active_engine
+    if _active_engine is None:
+        # Nadie llamó a set_ocr_engine() todavía -> se importa el motor por
+        # defecto recién ahora que hace falta de verdad.
+        set_ocr_engine(_active_engine_name)
+    return _active_engine
+
+
+def get_ocr_reader():
+    return _engine().get_ocr_reader()
+
+
+def recognize_letter(cell_gray):
+    return _engine().recognize_letter(cell_gray)
+
 TEMPLATES_DIR = "board_templates"
-LETTERS_DIR = os.path.join(TEMPLATES_DIR, "letters")
 EMPTY_BOARD_PATH = os.path.join(TEMPLATES_DIR, "empty_board.jpg")
 
 WARPED_SIZE = 600           # tablero corregido -> 600x600 px
 CELL_SIZE = WARPED_SIZE // BOARD_SIZE
 OCCUPIED_DIFF_THRESHOLD = 25   # sensibilidad para detectar "hay ficha aquí"
-MATCH_MIN_SCORE = 0.35         # umbral mínimo de confianza del template matching
 
 ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 ARUCO_PARAMS = cv2.aruco.DetectorParameters()
@@ -69,6 +114,46 @@ def find_board_corners(image):
     return ordered
 
 
+# Recuerda la última detección válida de los 4 marcadores. Se reutiliza
+# cuando un frame puntual falla en detectarlos (por ejemplo, una mano
+# tapando momentáneamente un marcador, o un frame con motion blur), en vez
+# de descartar ese frame por completo.
+#
+# IMPORTANTE: esto asume que, mientras los marcadores no se detectan de
+# nuevo, el tablero no se movió. Si el tablero se mueve justo durante ese
+# lapso sin detección, la calibración cacheada queda desactualizada hasta
+# la siguiente detección real.
+_last_known_corners = None
+
+
+def find_board_corners_cached(image):
+    """
+    Igual que find_board_corners(), pero si en este frame no se detectan
+    los 4 marcadores, reutiliza la última detección válida en vez de
+    devolver None.
+
+    Devuelve (corners, detected_now):
+      - corners: los 4 puntos a usar (de este frame o cacheados), o None si
+        todavía no hubo NINGUNA detección válida desde que arrancó el proceso.
+      - detected_now: True si los marcadores se detectaron en este frame
+        (calibración "fresca"), False si se está reutilizando la caché.
+    """
+    global _last_known_corners
+    corners = find_board_corners(image)
+    if corners is not None:
+        _last_known_corners = corners
+        return corners, True
+    return _last_known_corners, False
+
+
+def reset_corner_cache():
+    """Olvida la última detección cacheada (por ejemplo, si sabes que
+    moviste el tablero o la cámara y no quieres arrastrar una calibración
+    vieja hasta la próxima detección real)."""
+    global _last_known_corners
+    _last_known_corners = None
+
+
 def warp_board(image, src_points):
     dst_points = np.array([
         [0, 0],
@@ -83,15 +168,14 @@ def warp_board(image, src_points):
 
 
 def extract_cells(warped_gray):
-    """Devuelve una matriz BOARD_SIZE x BOARD_SIZE de recortes (imágenes) de cada casilla."""
+    """Devuelve una matriz BOARD_SIZE x BOARD_SIZE de recortes (imágenes) de cada casilla.
+    Se usa la celda completa, sin recortar margen interior."""
     cells = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             y0, y1 = r * CELL_SIZE, (r + 1) * CELL_SIZE
             x0, x1 = c * CELL_SIZE, (c + 1) * CELL_SIZE
-            # margen interior para evitar bordes de la rejilla
-            margin = int(CELL_SIZE * 0.12)
-            cell = warped_gray[y0 + margin:y1 - margin, x0 + margin:x1 - margin]
+            cell = warped_gray[y0:y1, x0:x1]
             cells[r][c] = cell
     return cells
 
@@ -113,27 +197,6 @@ def load_empty_board_cells():
     return extract_cells(warped)
 
 
-def load_letter_templates():
-    """Carga plantillas <LETRA>.png de board_templates/letters/ y las redimensiona
-    al tamaño de celda para comparación directa."""
-    templates = {}
-    if not os.path.isdir(LETTERS_DIR):
-        raise FileNotFoundError(
-            f"Falta la carpeta {LETTERS_DIR} con las plantillas de letras. Ver README.md."
-        )
-    for path in glob.glob(os.path.join(LETTERS_DIR, "*.png")):
-        letter = os.path.splitext(os.path.basename(path))[0].upper()
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        cell_px = CELL_SIZE - 2 * int(CELL_SIZE * 0.12)
-        img = cv2.resize(img, (cell_px, cell_px))
-        templates[letter] = img
-    if not templates:
-        raise RuntimeError("No se cargó ninguna plantilla de letra. Revisa board_templates/letters/.")
-    return templates
-
-
 # ---------------------------------------------------------------------------
 # Reconocimiento de una celda: vacía / ocupada / qué letra
 # ---------------------------------------------------------------------------
@@ -142,29 +205,18 @@ def cell_is_occupied(cell_gray, empty_ref_gray):
     return float(np.mean(diff)) > OCCUPIED_DIFF_THRESHOLD
 
 
-def recognize_letter(cell_gray, templates):
-    """Compara la celda contra todas las plantillas y devuelve (letra, score)."""
-    best_letter, best_score = None, -1.0
-    cell_norm = cv2.equalizeHist(cell_gray)
-    for letter, template in templates.items():
-        result = cv2.matchTemplate(cell_norm, cv2.equalizeHist(template), cv2.TM_CCOEFF_NORMED)
-        score = float(result.max())
-        if score > best_score:
-            best_score = score
-            best_letter = letter
-    if best_score < MATCH_MIN_SCORE:
-        return None, best_score
-    return best_letter, best_score
-
-
-def read_board(image, empty_cells, templates):
+def read_board(image, empty_cells):
     """
     Procesa una foto completa del tablero y devuelve una matriz BOARD_SIZE x BOARD_SIZE
     con la letra en cada casilla ocupada o None si está vacía.
     Devuelve (grid, warped_ok:bool)
+
+    Si los marcadores no se detectan en este frame puntual, se reutiliza la
+    última calibración válida conocida (ver find_board_corners_cached) en
+    vez de descartar el frame.
     """
     gray_full = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    corners = find_board_corners(image)
+    corners, detected_now = find_board_corners_cached(image)
     if corners is None:
         return None, False
 
@@ -175,8 +227,8 @@ def read_board(image, empty_cells, templates):
     for r in range(BOARD_SIZE):
         for c in range(BOARD_SIZE):
             if cell_is_occupied(cells[r][c], empty_cells[r][c]):
-                letter, score = recognize_letter(cells[r][c], templates)
-                grid[r][c] = letter  # puede ser None si no hay match seguro
+                letter, confidence = recognize_letter(cells[r][c])
+                grid[r][c] = letter  # puede ser None si no hay lectura confiable
     return grid, True
 
 

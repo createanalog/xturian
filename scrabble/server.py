@@ -47,11 +47,12 @@ class GameState:
         self.grid = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
         self.recent_frames = deque(maxlen=STABILITY_FRAMES)
         self.empty_cells = None
-        self.templates = None
 
     def load_calibration(self):
         self.empty_cells = sp.load_empty_board_cells()
-        self.templates = sp.load_letter_templates()
+        # Crear el lector de EasyOCR de una sola vez al arrancar (es costoso
+        # de instanciar - descarga/carga los pesos del modelo la primera vez).
+        sp.get_ocr_reader()
 
     def save(self):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -102,7 +103,7 @@ def upload():
     if not frames_are_stable(game.recent_frames):
         return jsonify({"status": "esperando_estabilidad"}), 200
 
-    grid, ok = sp.read_board(image, game.empty_cells, game.templates)
+    grid, ok = sp.read_board(image, game.empty_cells)
     if not ok:
         return jsonify({"status": "tablero_no_detectado"}), 200
 
@@ -237,10 +238,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--players", type=int, default=2, help="Número de jugadores")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument(
+        "--ocr-engine", type=str, default="tesseract",
+        choices=["easyocr", "ocrad", "tesseract"],
+        help="Motor de OCR a usar para leer las letras (default: tesseract)",
+    )
     args = parser.parse_args()
 
+    sp.set_ocr_engine(args.ocr_engine)
+    print(f"Motor de OCR: {args.ocr_engine}")
+
     game = GameState(args.players)
-    print("Cargando calibración (tablero vacío + plantillas de letras)...")
+    print("Cargando calibración (tablero vacío) y el modelo de OCR...")
     game.load_calibration()
     print("Calibración cargada. Servidor listo.")
     print(f"Panel web: http://0.0.0.0:{args.port}/")

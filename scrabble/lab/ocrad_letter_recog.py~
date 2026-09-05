@@ -1,0 +1,40 @@
+import sys
+import subprocess
+import os
+
+def leer_caracter_ocrad(ruta_imagen: str) -> str:
+    """
+    Recibe la ruta de una imagen, ejecuta OCRAD y retorna 
+    el carácter detectado como una cadena limpia.
+    """
+    if not os.path.exists(ruta_imagen):
+        raise FileNotFoundError(f"La imagen '{ruta_imagen}' no existe.")
+
+    # Ejecutar OCRAD pasando la imagen como argumento
+    # --charset=ascii restringe la búsqueda a caracteres estándar
+    resultado = subprocess.run(
+        ['ocrad', '--charset=ascii', ruta_imagen],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    # Limpiar saltos de línea y espacios en blanco del resultado
+    caracter = resultado.stdout.strip()
+    
+    return caracter
+
+
+if __name__ == "__main__":
+    # Comprobar que se haya pasado la ruta de la imagen como parámetro
+    if len(sys.argv) < 2:
+        print("Uso: python detectar_letra.py <ruta_de_la_imagen>")
+        sys.exit(1)
+
+    path_imagen = sys.argv[1]
+
+    try:
+        letra = leer_caracter_ocrad(path_imagen)
+        print(f"Resultado: {letra}")
+    except Exception as e:
+        print(f"Error al procesar la imagen: {e}")
