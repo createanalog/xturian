@@ -239,9 +239,9 @@ def main():
     parser.add_argument("--players", type=int, default=2, help="Número de jugadores")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument(
-        "--ocr-engine", type=str, default="tesseract",
-        choices=["easyocr", "ocrad", "tesseract"],
-        help="Motor de OCR a usar para leer las letras (default: tesseract)",
+        "--ocr-engine", type=str, default="paddleocr",
+        choices=["easyocr", "ocrad", "tesseract", "paddleocr"],
+        help="Motor de OCR a usar para leer las letras (default: paddleocr)",
     )
     args = parser.parse_args()
 

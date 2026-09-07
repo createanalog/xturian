@@ -5,8 +5,21 @@ Verificación visual EN VIVO, leyendo directamente de una webcam.
 Muestra en una ventana (cv2.imshow) el tablero ya enderezado por
 perspectiva, con:
   - la rejilla 15x15 dibujada.
-  - la letra reconocida (EasyOCR) escrita en VERDE BRILLANTE sobre cada
-    ficha detectada.
+  - la letra reconocida escrita en VERDE BRILLANTE sobre cada ficha
+    detectada.
+
+El OCR corre en un HILO SEPARADO del principal (ver OcrWorker más abajo).
+El hilo principal (captura de la webcam + cv2.imshow) nunca espera a que
+el OCR termine - sigue mostrando frames fluidos todo el tiempo, y la
+rejilla de letras que se dibuja es simplemente la última que el hilo de
+OCR terminó de calcular, aunque venga de un frame algo anterior. Antes de
+este cambio, cv2.imshow se congelaba cada vez que el OCR corría (podían
+ser varios segundos con algunos motores), porque todo pasaba en el mismo
+hilo que dibuja la ventana.
+
+Con los motores de OCR Tesseract o PaddleOCR, la lectura de letras se hace
+además en UNA SOLA pasada sobre todo el tablero por cada relectura (en vez
+de una llamada por cada casilla ocupada) - ver scrabble_processor.py.
 
 Sirve para comprobar de un vistazo, en tiempo real, si los marcadores
 ArUco están bien alineados y si el reconocimiento de letras funciona
@@ -28,6 +41,7 @@ Controles:
 """
 
 import argparse
+import threading
 import time
 
 import cv2
@@ -39,22 +53,75 @@ WINDOW_NAME = "Verificacion en vivo (q=salir)"
 LETTER_COLOR = (0, 255, 0)  # BGR -> verde brillante
 
 
-def draw_grid_and_letters(warped_gray, empty_cells):
-    """Devuelve una imagen BGR del tablero enderezado con la rejilla y,
-    sobre cada ficha detectada, su letra reconocida en verde brillante."""
+class OcrWorker:
+    """
+    Corre el reconocimiento de letras (sp.read_board_from_warped, que
+    puede tardar desde milisegundos hasta varios segundos según el motor)
+    en un hilo separado del principal, para que la ventana de vista previa
+    nunca se congele esperándolo.
+
+    Uso: maybe_start(...) se llama desde el hilo principal cada vez que
+    toca una relectura (según --ocr-interval); si el hilo de OCR ya está
+    ocupado procesando la relectura anterior, simplemente no hace nada
+    (se salta esta relectura en vez de acumular trabajo pendiente).
+    get_grid() devuelve el último resultado ya terminado, sea cual sea el
+    frame del que haya salido.
+    """
+
+    def __init__(self, empty_cells):
+        self.empty_cells = empty_cells
+        self._lock = threading.Lock()
+        self._grid = None
+        self._busy = False
+
+    def maybe_start(self, warped_gray, warped_color):
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+
+        thread = threading.Thread(
+            target=self._run, args=(warped_gray, warped_color), daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _run(self, warped_gray, warped_color):
+        try:
+            grid = sp.read_board_from_warped(
+                warped_gray, self.empty_cells, warped_color=warped_color,
+            )
+        except Exception as e:
+            print(f"[verify_alignment] Error en el hilo de OCR, se ignora este intento: {e}")
+            grid = None
+
+        with self._lock:
+            if grid is not None:
+                self._grid = grid
+            self._busy = False
+
+    def get_grid(self):
+        with self._lock:
+            return self._grid
+
+
+def draw_overlay(warped_gray, grid, extra_text=None):
+    """Dibuja la rejilla 15x15 y, si hay un resultado de OCR disponible
+    (grid, puede ser None si el hilo de OCR todavía no terminó su primera
+    pasada), las letras detectadas en verde brillante. No calcula nada de
+    OCR aquí - solo dibuja sobre lo que ya se tiene a mano, por eso es
+    seguro llamarla en cada frame sin afectar la fluidez."""
     overlay = cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
 
-    # Rejilla 15x15
     for i in range(BOARD_SIZE + 1):
         pos = i * sp.CELL_SIZE
         cv2.line(overlay, (pos, 0), (pos, sp.WARPED_SIZE), (0, 150, 0), 1)
         cv2.line(overlay, (0, pos), (sp.WARPED_SIZE, pos), (0, 150, 0), 1)
 
-    cells = sp.extract_cells(warped_gray)
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if sp.cell_is_occupied(cells[r][c], empty_cells[r][c]):
-                letter, confidence = sp.recognize_letter(cells[r][c])
+    if grid is not None:
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                letter = grid[r][c]
                 if letter:
                     x = c * sp.CELL_SIZE + int(sp.CELL_SIZE * 0.18)
                     y = r * sp.CELL_SIZE + int(sp.CELL_SIZE * 0.68)
@@ -63,6 +130,12 @@ def draw_grid_and_letters(warped_gray, empty_cells):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         LETTER_COLOR, 2, cv2.LINE_AA,
                     )
+
+    if extra_text:
+        cv2.putText(
+            overlay, extra_text, (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1,
+        )
     return overlay
 
 
@@ -75,12 +148,12 @@ def main():
                               "así que el ahorro real aquí es moderado).")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--ocr-interval", type=float, default=2.5,
-                         help="Segundos entre relecturas de OCR (el OCR es costoso; "
-                              "la vista previa sigue fluida entre relecturas).")
+                         help="Segundos entre relecturas de OCR (ahora corren en un hilo aparte, "
+                              "así que la vista previa nunca se congela esperándolas).")
     parser.add_argument(
-        "--ocr-engine", type=str, default="tesseract",
-        choices=["easyocr", "ocrad", "tesseract"],
-        help="Motor de OCR a usar para leer las letras (default: tesseract)",
+        "--ocr-engine", type=str, default="paddleocr",
+        choices=["easyocr", "ocrad", "tesseract", "paddleocr"],
+        help="Motor de OCR a usar para leer las letras (default: paddleocr)",
     )
     args = parser.parse_args()
 
@@ -99,9 +172,10 @@ def main():
         print(f"No se pudo abrir la cámara #{args.camera}")
         return
 
+    worker = OcrWorker(empty_cells)
+    last_ocr_trigger = 0.0
+
     print("Ventana activa. Teclas: [q] o [ESC] para salir.")
-    last_ocr_time = 0.0
-    last_overlay = None
 
     while True:
         ok, frame = cap.read()
@@ -119,18 +193,22 @@ def main():
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             warped_gray = sp.warp_board(gray, corners)
+            # frame ya es BGR (a color) - mismos corners/homografía que
+            # warped_gray, para que los motores que sí aprovechan color
+            # real (ej. PaddleOCR) lo reciban en vez de gris replicado.
+            warped_color = sp.warp_board(frame, corners)
 
             now = time.time()
-            if last_overlay is None or (now - last_ocr_time) >= args.ocr_interval:
-                last_ocr_time = now
-                last_overlay = draw_grid_and_letters(warped_gray, empty_cells)
-                if not detected_now:
-                    cv2.putText(
-                        last_overlay, "usando ultima calibracion conocida",
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1,
-                    )
+            if (now - last_ocr_trigger) >= args.ocr_interval:
+                last_ocr_trigger = now
+                # No bloquea: si el hilo de OCR ya está ocupado con la
+                # relectura anterior, maybe_start() no hace nada y
+                # simplemente se reintenta en el próximo tick.
+                worker.maybe_start(warped_gray, warped_color)
 
-            cv2.imshow(WINDOW_NAME, last_overlay)
+            extra_text = "usando ultima calibracion conocida" if not detected_now else None
+            overlay = draw_overlay(warped_gray, worker.get_grid(), extra_text)
+            cv2.imshow(WINDOW_NAME, overlay)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):  # q o ESC

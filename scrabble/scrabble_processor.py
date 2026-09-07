@@ -37,8 +37,9 @@ _OCR_ENGINE_MODULES = {
     "easyocr": "lrecog_easyocr",
     "ocrad": "lrecog_ocrad",
     "tesseract": "lrecog_tesseract",
+    "paddleocr": "lrecog_paddleocr",
 }
-DEFAULT_OCR_ENGINE = "tesseract"
+DEFAULT_OCR_ENGINE = "paddleocr"
 
 _active_engine = None
 _active_engine_name = DEFAULT_OCR_ENGINE
@@ -205,6 +206,46 @@ def cell_is_occupied(cell_gray, empty_ref_gray):
     return float(np.mean(diff)) > OCCUPIED_DIFF_THRESHOLD
 
 
+def read_board_from_warped(warped_gray, empty_cells, warped_color=None):
+    """
+    Dado el tablero YA enderezado por perspectiva, produce la rejilla de
+    letras. Separado de read_board() para que quien ya tenga el tablero
+    enderezado a mano (por ejemplo, verify_alignment.py) no tenga que
+    volver a detectar los marcadores ni recalcular el warp.
+
+    warped_color es opcional: el tablero enderezado A COLOR (mismos
+    marcadores/homografía que warped_gray, pero sin pasar por escala de
+    grises). Solo lo usan los motores que de verdad necesitan color real
+    (hoy, PaddleOCR) - el resto sigue trabajando en escala de grises sin
+    ningún cambio de comportamiento.
+
+    Si el motor de OCR activo expone recognize_board() (una sola pasada
+    sobre todo el tablero - hoy lrecog_tesseract.py y lrecog_paddleocr.py
+    la implementan), se usa esa vía por ser mucho más rápida. Si no, se
+    cae al enfoque celda por celda (recognize_letter por cada casilla
+    ocupada).
+    """
+    engine = _engine()
+    cells = extract_cells(warped_gray)
+
+    if hasattr(engine, "recognize_board"):
+        def _is_occupied(r, c):
+            return cell_is_occupied(cells[r][c], empty_cells[r][c])
+
+        return engine.recognize_board(
+            warped_gray, CELL_SIZE, BOARD_SIZE, is_occupied_fn=_is_occupied,
+            warped_color=warped_color,
+        )
+
+    grid = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            if cell_is_occupied(cells[r][c], empty_cells[r][c]):
+                letter, confidence = recognize_letter(cells[r][c])
+                grid[r][c] = letter  # puede ser None si no hay lectura confiable
+    return grid
+
+
 def read_board(image, empty_cells):
     """
     Procesa una foto completa del tablero y devuelve una matriz BOARD_SIZE x BOARD_SIZE
@@ -216,19 +257,19 @@ def read_board(image, empty_cells):
     vez de descartar el frame.
     """
     gray_full = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    color_full = image if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     corners, detected_now = find_board_corners_cached(image)
     if corners is None:
         return None, False
 
-    warped = warp_board(gray_full, corners)
-    cells = extract_cells(warped)
+    warped_gray = warp_board(gray_full, corners)
+    # Mismos 4 puntos/homografía que warped_gray - warp_board() funciona
+    # igual con imágenes de 1 o 3 canales, así que esto es barato de
+    # calcular siempre (perspectiva sobre 600x600 es trivial frente al
+    # costo real, que es el OCR).
+    warped_color = warp_board(color_full, corners)
 
-    grid = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if cell_is_occupied(cells[r][c], empty_cells[r][c]):
-                letter, confidence = recognize_letter(cells[r][c])
-                grid[r][c] = letter  # puede ser None si no hay lectura confiable
+    grid = read_board_from_warped(warped_gray, empty_cells, warped_color=warped_color)
     return grid, True
 
 

@@ -23,18 +23,19 @@ más potencia de la que tiene la placa) ocurre en tu ordenador.
 
 ## 1. Instalación
 
-El reconocimiento de letras es intercambiable entre **tres motores de OCR**
-distintos, elegibles con `--ocr-engine {tesseract,easyocr,ocrad}` al arrancar
-`server.py` o `verify_alignment.py`. **Por defecto se usa `tesseract`** si no
-especificas nada. Solo necesitas instalar el motor que realmente vayas a usar
-(la carga de cada uno es perezosa - no hace falta tener los 3 instalados).
+El reconocimiento de letras es intercambiable entre **cuatro motores de OCR**
+distintos, elegibles con `--ocr-engine {tesseract,easyocr,ocrad,paddleocr}` al
+arrancar `server.py` o `verify_alignment.py`. **Por defecto se usa
+`paddleocr`** si no especificas nada. Solo necesitas instalar el motor que
+realmente vayas a usar (la carga de cada uno es perezosa - no hace falta
+tener los 4 instalados).
 
 Dependencias base (siempre necesarias, sin importar el motor de OCR):
 ```bash
 pip install flask opencv-contrib-python numpy
 ```
 
-**Tesseract (motor por defecto):**
+**Tesseract:**
 ```bash
 sudo apt install tesseract-ocr tesseract-ocr-spa   # Ubuntu/Debian
 brew install tesseract tesseract-lang               # macOS
@@ -67,6 +68,27 @@ brew install ocrad        # macOS
 No necesita ningún paquete de Python adicional — se invoca como binario
 de línea de comandos.
 
+**PaddleOCR (motor por defecto):**
+```bash
+pip install paddlepaddle paddleocr
+```
+**Advertencia importante, aunque sea el default:** a diferencia de
+Tesseract, PaddleOCR detecta texto a nivel de palabra/línea completa, no
+carácter por carácter. Si dos o más fichas quedan adyacentes formando una
+palabra real (lo normal en cualquier partida en curso), el código reparte
+los caracteres de esa palabra a lo largo del ancho del cuadro detectado
+para asignar cada uno a su casilla — es una aproximación razonable, pero
+menos precisa que la granularidad nativa por carácter de Tesseract. Si
+notas errores de asignación en palabras largas o con letras de ancho muy
+distinto, prueba `--ocr-engine tesseract` para comparar.
+
+Nota técnica: PaddleOCR recibe el tablero **a color real** (no una
+imagen en escala de grises replicada a 3 canales) — el resto del
+pipeline trabaja en escala de grises desde el inicio, así que
+`read_board()` calcula un segundo warp de perspectiva sobre la imagen a
+color original específicamente para esto. Los demás motores (Tesseract,
+EasyOCR, Ocrad) no lo necesitan y siguen usando solo la versión en gris.
+
 Nota general: usa `opencv-contrib-python` (no `opencv-python` a secas) para
 tener disponible el módulo `cv2.aruco`.
 
@@ -96,7 +118,11 @@ tener disponible el módulo `cv2.aruco`.
    ```
    Se abre una ventana en vivo con el tablero enderezado, la rejilla 15x15
    dibujada, y la letra reconocida por OCR escrita en **verde brillante**
-   sobre cada ficha detectada. Si la rejilla no coincide con los bordes
+   sobre cada ficha detectada. El OCR corre en un hilo separado del que
+   dibuja la ventana, así que la vista previa nunca se congela mientras
+   procesa — las letras mostradas pueden quedar uno o dos frames
+   "atrasadas" respecto al tablero en vivo, pero la imagen de fondo
+   siempre es la actual. Si la rejilla no coincide con los bordes
    reales de las casillas, reajusta la posición de los marcadores; si las
    letras no se leen bien, prueba mejorando la luz o el enfoque. Cierra con
    `q` o `ESC`. (Necesita que ya hayas calibrado el tablero vacío, ver
@@ -134,18 +160,18 @@ simplemente una foto con el móvil desde el mismo ángulo) y ejecuta:
 python calibrate.py empty foto_tablero_vacio.jpg
 ```
 
-Con eso basta — el reconocimiento de letras usa OCR (Tesseract, EasyOCR u
-Ocrad, según elijas), que **no necesita** plantillas ni fotos previas por
-cada letra.
+Con eso basta — el reconocimiento de letras usa OCR (Tesseract, EasyOCR,
+Ocrad o PaddleOCR, según elijas), que **no necesita** plantillas ni fotos
+previas por cada letra.
 
 ## 6. Arrancar el servidor
 
 ```bash
 python server.py --players 2
-python server.py --players 2 --ocr-engine easyocr   # o --ocr-engine ocrad
+python server.py --players 2 --ocr-engine tesseract   # o --ocr-engine easyocr / ocrad
 ```
 
-Si no especificas `--ocr-engine`, se usa **Tesseract** por defecto.
+Si no especificas `--ocr-engine`, se usa **PaddleOCR** por defecto.
 
 Abre `http://TU_PC:5000/` para ver el marcador en vivo. Los turnos se asignan
 de forma automática y rotativa (jugador 1, 2, 3... y vuelve a empezar) cada
@@ -154,9 +180,13 @@ vez que se detecta una jugada válida y estable.
 ## Limitaciones importantes (léelo antes de confiar en el marcador)
 
 - **El reconocimiento de letras es el eslabón más débil, y varía según el
-  motor de OCR elegido.** Tesseract (el default) y EasyOCR son más
-  tolerantes al ruido/blur/iluminación que Ocrad, pero ninguno es
-  perfecto — cualquiera puede confundir letras parecidas o fallar con
+  motor de OCR elegido.** PaddleOCR (el default) recibe color real y suele
+  ser tolerante al ruido/iluminación, pero reconoce a nivel de
+  palabra/línea, no por carácter — su precisión en palabras largas o con
+  letras muy dispares en ancho depende de la aproximación geométrica de
+  reparto (ver la advertencia en la sección de instalación). Tesseract es
+  más lento por celda pero con granularidad exacta por carácter. Ninguno
+  es perfecto — cualquiera puede confundir letras parecidas o fallar con
   fotos muy desenfocadas. Si uno rinde mal con tu tablero/iluminación,
   prueba con `--ocr-engine` cambiando de motor antes de asumir que hay
   que ajustar la calibración física. Revisa el panel web tras cada jugada.
@@ -166,6 +196,16 @@ vez que se detecta una jugada válida y estable.
   leer ese dígito de fondo — pero como está en el allowlist, se reconoce
   correctamente como dígito y se descarta en vez de forzarse a la letra
   más parecida. Esas casillas simplemente no generan ninguna ficha nueva.
+- **Con Tesseract y PaddleOCR, la lectura del tablero es de una sola
+  pasada, no celda por celda.** `recognize_board()` corre el motor UNA
+  vez sobre las 225 casillas juntas y asigna cada letra detectada a la
+  casilla que le corresponde, en vez de invocar el motor 20-25 veces
+  (una por ficha) — esto evita pagar repetidamente el costo de arrancar
+  el proceso y cargar el modelo, que era la causa real de demoras de
+  varios segundos por lectura con el enfoque celda por celda. EasyOCR y
+  Ocrad siguen usando ese enfoque celda por celda (no tienen ese cuello
+  de botella de recarga de modelo por invocación, así que no lo
+  necesitan tanto).
 - Los dígrafos del set clásico en español (**CH, LL, RR**) se leen como
   texto de 2 caracteres de forma natural; si tu edición no los tiene como
   fichas propias, no afecta en nada — simplemente no aparecerán.

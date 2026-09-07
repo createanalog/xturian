@@ -66,7 +66,13 @@ def main():
                     upload_url,
                     data=jpg.tobytes(),
                     headers={"Content-Type": "image/jpeg"},
-                    timeout=5,
+                    # El servidor hace todo el análisis (detección de
+                    # marcadores + OCR de las 225 casillas) de forma
+                    # SÍNCRONA dentro de este mismo request - con motores
+                    # como PaddleOCR o Tesseract, sobre todo en la primera
+                    # llamada (carga del modelo) o con pocos hilos de CPU,
+                    # puede tardar bastante más que unos pocos segundos.
+                    timeout=30,
                 )
                 print(f"[{time.strftime('%H:%M:%S')}] foto enviada -> {resp.status_code} {resp.json()}")
             except requests.RequestException as e:
