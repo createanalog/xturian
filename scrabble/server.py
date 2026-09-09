@@ -26,6 +26,7 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 
 import scrabble_processor as sp
+import vision_manager as vm
 from board_config import BOARD_SIZE
 
 app = Flask(__name__)
@@ -49,10 +50,10 @@ class GameState:
         self.empty_cells = None
 
     def load_calibration(self):
-        self.empty_cells = sp.load_empty_board_cells()
+        #self.empty_cells = sp.load_empty_board_cells()
         # Crear el lector de EasyOCR de una sola vez al arrancar (es costoso
         # de instanciar - descarga/carga los pesos del modelo la primera vez).
-        sp.get_ocr_reader()
+        vm.get_ocr_reader()
 
     def save(self):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -103,9 +104,9 @@ def upload():
     if not frames_are_stable(game.recent_frames):
         return jsonify({"status": "esperando_estabilidad"}), 200
 
-    grid, ok = sp.read_board(image, game.empty_cells)
-    if not ok:
-        return jsonify({"status": "tablero_no_detectado"}), 200
+    grid = vm.read_board(image)
+    #if not ok:
+     #   return jsonify({"status": "tablero_no_detectado"}), 200
 
     new_positions = sp.diff_new_tiles(game.grid, grid)
 
@@ -245,7 +246,7 @@ def main():
     )
     args = parser.parse_args()
 
-    sp.set_ocr_engine(args.ocr_engine)
+    vm.set_ocr_engine(args.ocr_engine)
     print(f"Motor de OCR: {args.ocr_engine}")
 
     game = GameState(args.players)

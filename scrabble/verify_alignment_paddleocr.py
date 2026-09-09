@@ -32,6 +32,7 @@ import time
 import cv2
 
 import scrabble_processor as sp
+import vision_manager as vm
 import lrecog_paddleocr as paddle_engine
 from board_config import BOARD_SIZE
 
@@ -100,9 +101,9 @@ def draw_boxes(warped_color, results):
     overlay = warped_color.copy()
 
     for i in range(BOARD_SIZE + 1):
-        pos = i * sp.CELL_SIZE
-        cv2.line(overlay, (pos, 0), (pos, sp.WARPED_SIZE), GRID_COLOR, 1)
-        cv2.line(overlay, (0, pos), (sp.WARPED_SIZE, pos), GRID_COLOR, 1)
+        pos = i * vm.CELL_SIZE
+        cv2.line(overlay, (pos, 0), (pos, vm.WARPED_SIZE), GRID_COLOR, 1)
+        cv2.line(overlay, (0, pos), (vm.WARPED_SIZE, pos), GRID_COLOR, 1)
 
     for texto, bbox, score in results:
         pts = bbox.astype(int).reshape(-1, 1, 2)
@@ -150,7 +151,7 @@ def main():
             print("Error leyendo frame de la webcam")
             break
 
-        corners, detected_now = sp.find_board_corners_cached(frame)
+        corners = vm.find_board_corners(frame)
         if corners is None:
             cv2.putText(
                 frame, "Tablero no detectado (revisa marcadores ArUco)",
@@ -160,7 +161,7 @@ def main():
         else:
             # frame ya es BGR (a color) - PaddleOCR recibe color real,
             # igual que en el pipeline principal.
-            warped_color = sp.warp_board(frame, corners)
+            warped_color = vm.warp_board(frame, corners)
 
             now = time.time()
             if (now - last_ocr_trigger) >= args.ocr_interval:
@@ -168,11 +169,11 @@ def main():
                 worker.maybe_start(warped_color)
 
             overlay = draw_boxes(warped_color, worker.get_results())
-            if not detected_now:
-                cv2.putText(
-                    overlay, "usando ultima calibracion conocida",
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1,
-                )
+            
+            cv2.putText(
+                overlay, "usando ultima calibracion conocida",
+                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1,
+            )
             cv2.imshow(WINDOW_NAME, overlay)
 
         key = cv2.waitKey(1) & 0xFF

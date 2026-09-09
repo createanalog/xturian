@@ -47,6 +47,7 @@ import time
 import cv2
 
 import scrabble_processor as sp
+import vision_manager as vm
 from board_config import BOARD_SIZE
 
 WINDOW_NAME = "Verificacion en vivo (q=salir)"
@@ -68,29 +69,27 @@ class OcrWorker:
     frame del que haya salido.
     """
 
-    def __init__(self, empty_cells):
-        self.empty_cells = empty_cells
+    def __init__(self):
         self._lock = threading.Lock()
         self._grid = None
         self._busy = False
 
-    def maybe_start(self, warped_gray, warped_color):
+    def maybe_start(self, image):
         with self._lock:
             if self._busy:
                 return False
             self._busy = True
 
         thread = threading.Thread(
-            target=self._run, args=(warped_gray, warped_color), daemon=True,
+            target=self._run, args=(image,), daemon=True,
         )
         thread.start()
         return True
 
-    def _run(self, warped_gray, warped_color):
+    def _run(self, image):
         try:
-            grid = sp.read_board_from_warped(
-                warped_gray, self.empty_cells, warped_color=warped_color,
-            )
+            print(f"El tipo de la variable es: {type(image)}")
+            grid = vm.read_board(image)
         except Exception as e:
             print(f"[verify_alignment] Error en el hilo de OCR, se ignora este intento: {e}")
             grid = None
@@ -105,26 +104,27 @@ class OcrWorker:
             return self._grid
 
 
-def draw_overlay(warped_gray, grid, extra_text=None):
+
+def draw_overlay(warped, grid, extra_text=None):
     """Dibuja la rejilla 15x15 y, si hay un resultado de OCR disponible
     (grid, puede ser None si el hilo de OCR todavía no terminó su primera
     pasada), las letras detectadas en verde brillante. No calcula nada de
     OCR aquí - solo dibuja sobre lo que ya se tiene a mano, por eso es
     seguro llamarla en cada frame sin afectar la fluidez."""
-    overlay = cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
+    overlay = warped#cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
 
     for i in range(BOARD_SIZE + 1):
-        pos = i * sp.CELL_SIZE
-        cv2.line(overlay, (pos, 0), (pos, sp.WARPED_SIZE), (0, 150, 0), 1)
-        cv2.line(overlay, (0, pos), (sp.WARPED_SIZE, pos), (0, 150, 0), 1)
+        pos = i * vm.CELL_SIZE
+        cv2.line(overlay, (pos, 0), (pos, vm.WARPED_SIZE), (0, 150, 0), 1)
+        cv2.line(overlay, (0, pos), (vm.WARPED_SIZE, pos), (0, 150, 0), 1)
 
     if grid is not None:
         for r in range(BOARD_SIZE):
             for c in range(BOARD_SIZE):
                 letter = grid[r][c]
                 if letter:
-                    x = c * sp.CELL_SIZE + int(sp.CELL_SIZE * 0.18)
-                    y = r * sp.CELL_SIZE + int(sp.CELL_SIZE * 0.68)
+                    x = c * vm.CELL_SIZE + int(vm.CELL_SIZE * 0.18)
+                    y = r * vm.CELL_SIZE + int(vm.CELL_SIZE * 0.68)
                     cv2.putText(
                         overlay, letter, (x, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -157,13 +157,11 @@ def main():
     )
     args = parser.parse_args()
 
-    sp.set_ocr_engine(args.ocr_engine)
+    vm.set_ocr_engine(args.ocr_engine)
     print(f"Motor de OCR: {args.ocr_engine}")
 
-    print("Cargando tablero vacío de referencia...")
-    empty_cells = sp.load_empty_board_cells()
     print("Cargando modelo de OCR (puede tardar la primera vez)...")
-    sp.get_ocr_reader()
+    vm.get_ocr_reader()
 
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -172,7 +170,7 @@ def main():
         print(f"No se pudo abrir la cámara #{args.camera}")
         return
 
-    worker = OcrWorker(empty_cells)
+    worker = OcrWorker()
     last_ocr_trigger = 0.0
 
     print("Ventana activa. Teclas: [q] o [ESC] para salir.")
@@ -183,7 +181,7 @@ def main():
             print("Error leyendo frame de la webcam")
             break
 
-        corners, detected_now = sp.find_board_corners_cached(frame)
+        corners = vm.find_board_corners(frame)
         if corners is None:
             cv2.putText(
                 frame, "Tablero no detectado (revisa marcadores ArUco)",
@@ -191,23 +189,17 @@ def main():
             )
             cv2.imshow(WINDOW_NAME, frame)
         else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            warped_gray = sp.warp_board(gray, corners)
-            # frame ya es BGR (a color) - mismos corners/homografía que
-            # warped_gray, para que los motores que sí aprovechan color
-            # real (ej. PaddleOCR) lo reciban en vez de gris replicado.
-            warped_color = sp.warp_board(frame, corners)
-
+           
             now = time.time()
             if (now - last_ocr_trigger) >= args.ocr_interval:
                 last_ocr_trigger = now
                 # No bloquea: si el hilo de OCR ya está ocupado con la
                 # relectura anterior, maybe_start() no hace nada y
                 # simplemente se reintenta en el próximo tick.
-                worker.maybe_start(warped_gray, warped_color)
+                worker.maybe_start(frame)
 
-            extra_text = "usando ultima calibracion conocida" if not detected_now else None
-            overlay = draw_overlay(warped_gray, worker.get_grid(), extra_text)
+            warped = vm.warp_board(frame, corners)
+            overlay = draw_overlay(warped, worker.get_grid(), "")
             cv2.imshow(WINDOW_NAME, overlay)
 
         key = cv2.waitKey(1) & 0xFF
