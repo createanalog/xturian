@@ -161,7 +161,7 @@ def main():
         else:
             # frame ya es BGR (a color) - PaddleOCR recibe color real,
             # igual que en el pipeline principal.
-            warped_color = vm.warp_board(frame, corners)
+            warped_color = vm._warp_board(frame, corners)
 
             now = time.time()
             if (now - last_ocr_trigger) >= args.ocr_interval:

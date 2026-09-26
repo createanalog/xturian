@@ -38,7 +38,7 @@ def _find_contiguous_word(grid, r, c, horizontal):
         while cc >= 0 and grid[r][cc] is not None:
             positions.insert(0, (r, cc))
             cc -= 1
-        cc = c + 1
+        c[Oc = c + 1
         while cc < BOARD_SIZE and grid[r][cc] is not None:
             positions.append((r, cc))
             cc += 1

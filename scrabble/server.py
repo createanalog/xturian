@@ -1,42 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-Servidor que recibe las fotos de la ESP32-CAM, detecta cada jugada de
-Scrabble y mantiene el marcador acumulado por jugador.
+Scrabble game counter server
 
-Uso:
+Use:
     python server.py --players 2
-    (o --players 4, etc. Los jugadores se numeran 1..N y juegan por turnos
-     en ese orden, ronda tras ronda - ver README.md para cómo cambiarlo)
-
+  
 Endpoints:
-    POST /upload      <- la ESP32-CAM sube aquí cada foto (body = JPEG binario)
-    GET  /score        -> JSON con el marcador y el historial de jugadas
-    GET  /              -> panel web simple para ver el marcador en vivo
+    POST /upload      <- to upload video image
+    GET  /score        -> outputs JSON
+    GET  /              -> Web panel
 """
 
 import argparse
-import io
 import json
 import os
+import threading
 import time
-from collections import deque
+import logging
 
 import cv2
 import numpy as np
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 
 import scrabble_processor as sp
 import vision_manager as vm
 from board_config import BOARD_SIZE
 
+# Configuración GLOBAL (solo aquí)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("app.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
 app = Flask(__name__)
 
 STATE_FILE = "game_state.json"
 
-# Cuántas fotos "iguales" seguidas exigimos antes de considerar el tablero
-# estable (evita procesar mientras una mano todavía se está moviendo).
-STABILITY_FRAMES = 3
-STABILITY_DIFF_THRESHOLD = 8  # diferencia media de píxel entre frames consecutivos
+last_image = None
+state_lock = threading.Lock()
 
 
 class GameState:
@@ -44,23 +52,16 @@ class GameState:
         self.num_players = num_players
         self.current_player = 1
         self.scores = {i: 0 for i in range(1, num_players + 1)}
-        self.history = []  # lista de dicts: jugador, palabras, puntos, timestamp
+        self.history = []  # jugador, palabras, puntos, timestamp
         self.grid = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
-        self.recent_frames = deque(maxlen=STABILITY_FRAMES)
         self.empty_cells = None
-
-    def load_calibration(self):
-        #self.empty_cells = sp.load_empty_board_cells()
-        # Crear el lector de EasyOCR de una sola vez al arrancar (es costoso
-        # de instanciar - descarga/carga los pesos del modelo la primera vez).
-        vm.get_ocr_reader()
 
     def save(self):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "scores": self.scores,
-                "history": self.history,
                 "current_player": self.current_player,
+                 "history": self.history,
             }, f, ensure_ascii=False, indent=2)
 
     def to_dict(self):
@@ -74,111 +75,93 @@ class GameState:
 game = None  # se inicializa en main()
 
 
-def frames_are_stable(frames):
-    if len(frames) < STABILITY_FRAMES:
-        return False
-    ref = frames[0]
-    for f in list(frames)[1:]:
-        if f.shape != ref.shape:
-            return False
-        diff = float(np.mean(cv2.absdiff(f, ref)))
-        if diff > STABILITY_DIFF_THRESHOLD:
-            return False
-    return True
-
-
 @app.route("/upload", methods=["POST"])
 def upload():
+    
     raw = request.get_data()
     if not raw:
-        return jsonify({"status": "error", "msg": "sin datos"}), 400
+        return jsonify({"status": "error", "msg": "no data"}), 400
 
     npimg = np.frombuffer(raw, dtype=np.uint8)
     image = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    
     if image is None:
-        return jsonify({"status": "error", "msg": "JPEG inválido"}), 400
+        return jsonify({"status": "error", "msg": "Invalid jpeg"}), 400
 
-    small_gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (200, 200))
-    game.recent_frames.append(small_gray)
+    global last_image
+    
+    with state_lock:
+        last_image = image
+        scores = dict(game.scores)
+        siguiente_turno = game.current_player
 
-    if not frames_are_stable(game.recent_frames):
-        return jsonify({"status": "esperando_estabilidad"}), 200
-
-    grid = vm.read_board(image)
-    #if not ok:
-     #   return jsonify({"status": "tablero_no_detectado"}), 200
-
-    new_positions = sp.diff_new_tiles(game.grid, grid)
-
-    # Si hay letras "desconocidas" (None) entre las nuevas casillas ocupadas,
-    # no arriesgamos a puntuar mal: se espera a una foto más nítida.
-    if not new_positions:
-        return jsonify({"status": "sin_cambios"}), 200
-
-    unresolved = [pos for pos in new_positions if grid[pos[0]][pos[1]] is None]
-    if unresolved:
-        return jsonify({"status": "letras_no_reconocidas", "casillas": unresolved}), 200
-
-    # Validar que las fichas nuevas están alineadas (misma fila o misma columna)
-    rows = {r for r, c in new_positions}
-    cols = {c for r, c in new_positions}
-    if len(rows) > 1 and len(cols) > 1:
-        return jsonify({"status": "jugada_no_alineada", "casillas": new_positions}), 200
-
-    points, detail = sp.score_play(grid, new_positions)
-
-    game.grid = grid
-    game.scores[game.current_player] += points
-    game.history.append({
-        "jugador": game.current_player,
-        "casillas": new_positions,
-        "palabras": detail,
-        "puntos": points,
-        "acumulado": game.scores[game.current_player],
-        "timestamp": time.time(),
-    })
-    game.current_player = (game.current_player % game.num_players) + 1
-    game.save()
+    vm.imageSeen(last_image)
 
     return jsonify({
-        "status": "jugada_registrada",
-        "puntos": points,
-        "detalle": detail,
-        "marcador": game.scores,
-        "siguiente_turno": game.current_player,
+        "status": "image_upload_ok",
+        "marcador": scores,
+        "siguiente_turno": siguiente_turno,
     }), 200
+    
+    
+@app.route("/play", methods=["POST"])
+def play():
 
+    with state_lock:             # TODO: This can take a loooong time.
+        
+        if last_image is None:
+            return jsonify({"status": "No game image"}), 200
 
-@app.route("/next_turn", methods=["POST", "GET"])
-def next_turn():
-    """
-    Cambio de turno manual (botón físico en la ESP32-CAM, o llamado a mano).
-    Útil cuando un jugador pasa turno, cambia fichas, o hay que corregir
-    la rotación automática por algún motivo.
-    """
-    jugador_anterior = game.current_player
-    game.current_player = (game.current_player % game.num_players) + 1
-    game.history.append({
-        "jugador": jugador_anterior,
-        "casillas": [],
-        "palabras": [],
-        "puntos": 0,
-        "acumulado": game.scores[jugador_anterior],
-        "manual": True,
-        "nota": "Cambio de turno manual (botón)",
-        "timestamp": time.time(),
-    })
-    game.save()
-    return jsonify({
-        "status": "turno_cambiado",
-        "jugador_anterior": jugador_anterior,
-        "turno_actual": game.current_player,
-    }), 200
+        grid = vm.read_board(last_image)
 
+        if grid is None:
+            return jsonify({"status": "Can't detect Board"}), 200    # TODO: define a STATUS field in panel screen
+
+        new_positions = sp.find_new_tiles(game.grid, grid)
+
+        if not new_positions:
+            return jsonify({"status": "no_changes"}), 200
+
+        rows = {r for r, c in new_positions}
+        cols = {c for r, c in new_positions}
+        if len(rows) > 1 and len(cols) > 1:
+            return jsonify({"status": "non aligned play", "positions": new_positions}), 200
+
+        points, detail = sp.score_play(grid, new_positions)
+
+        game.grid = grid
+        game.scores[game.current_player] += points
+        game.history.append({
+            "jugador": game.current_player,
+            "casillas": list(new_positions),
+            "palabras": detail,
+            "puntos": points,
+            "acumulado": game.scores[game.current_player],
+            "timestamp": time.time(),
+        })
+        game.current_player = (game.current_player % game.num_players) + 1
+        game.save()
+
+    return redirect(url_for("panel"))
+    
 
 @app.route("/score", methods=["GET"])
 def score():
     return jsonify(game.to_dict())
+
+
+@app.route("/", methods=["GET"])
+def panel():
+
+    with state_lock:
+        d = game.to_dict()
+
+    return render_template_string(
+        PANEL_HTML,
+        scores=d["scores"],
+        current_player=d["current_player"],
+        history=d["history"],
+    )
 
 
 PANEL_HTML = """
@@ -199,6 +182,13 @@ PANEL_HTML = """
 </head>
 <body>
 <h1>Marcador Scrabble</h1>
+
+<form action="/play" method="post" style="margin-bottom: 1rem;">
+  <button type="submit" style="padding: 10px 20px; font-size: 1rem; cursor: pointer;">
+    📸 Process Play / Turn
+  </button>
+</form>
+
 {% for jugador, puntos in scores.items() %}
   <div class="score">Jugador {{ jugador }}: {{ puntos }} puntos
     {% if jugador == current_player %}<span class="turno"> (turno actual)</span>{% endif %}
@@ -223,40 +213,27 @@ PANEL_HTML = """
 """
 
 
-@app.route("/", methods=["GET"])
-def panel():
-    d = game.to_dict()
-    return render_template_string(
-        PANEL_HTML,
-        scores=d["scores"],
-        current_player=d["current_player"],
-        history=d["history"],
-    )
-
-
 def main():
+    
     global game
     parser = argparse.ArgumentParser()
-    parser.add_argument("--players", type=int, default=2, help="Número de jugadores")
+    parser.add_argument("--players", type=int, default=2, help="Players number")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument(
         "--ocr-engine", type=str, default="paddleocr",
-        choices=["easyocr", "ocrad", "tesseract", "paddleocr"],
-        help="Motor de OCR a usar para leer las letras (default: paddleocr)",
+        choices=["easyocr",  "paddleocr"],
+        help="OCR engine: paddleocr (default) or easyocr)",
     )
     args = parser.parse_args()
 
     vm.set_ocr_engine(args.ocr_engine)
-    print(f"Motor de OCR: {args.ocr_engine}")
+    print(f"OCR engine: {args.ocr_engine}")
 
     game = GameState(args.players)
-    print("Cargando calibración (tablero vacío) y el modelo de OCR...")
-    game.load_calibration()
-    print("Calibración cargada. Servidor listo.")
-    print(f"Panel web: http://0.0.0.0:{args.port}/")
+
+    print(f"Web: http://0.0.0.0:{args.port}/")
 
     app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
-
 
 if __name__ == "__main__":
     main()
